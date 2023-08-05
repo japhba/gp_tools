@@ -1,7 +1,6 @@
 from matplotlib import pyplot as plt
 import numpy as np
 
-from test_fractal_spectrums import get_k_ft
 f = 1
 l = np.pi/4
 N = 5
