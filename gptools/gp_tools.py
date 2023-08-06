@@ -9,6 +9,9 @@ DISABLE_CACHE = False
 memory = Memory(location=None if DISABLE_CACHE else Path(__file__).parents[0] / "cache", verbose=0)
 filename = os.path.basename(__file__).replace('.py', '')
 
+# create logger
+import logging
+logger = logging.getLogger(__name__)
 
 def get_GP_samples(X_train=None, N_samples=1, K=None, k_dx=None, seed=1235, reg=0., dX_mode ="norm", pdify=False, check_valid="warn"):
     if K is None:
@@ -204,16 +207,33 @@ def get_kappa(lmbd, spec, P):
     """
     Canatar21, eq. (4)
     """
-    from scipy.optimize import fixed_point
+    from scipy.optimize import fixed_point, root_scalar
 
     assert np.ndim(spec) == 1
-    assert np.isscalar(lmbd)
     assert np.isscalar(P)
+    assert lmbd >= 0
 
     def fix(kappa):
-        return lmbd + np.sum(kappa*spec/(P*spec + kappa))
+        return lmbd + np.sum(kappa*spec/(kappa+P*spec))
     
-    kappa = fixed_point(fix, 1e-3)
+    fix = np.vectorize(fix)
+    zero = lambda kappa: fix(kappa) - kappa
+    
+    
+    kappa = root_scalar(zero, bracket=[0., 10.], method='brentq').root
+    # kappa = fixed_point(fix, 1e-3)
+    logger.info(f"Found self-consistent kappa={kappa}, rel. fixpoint discrepancy is {np.abs(fix(kappa)-kappa)/kappa:.4f}")
+    # # plot
+    # import matplotlib.pyplot as plt
+    # plt.close()
+    # kappas = np.linspace(-10, 10, 1000)
+    # plt.plot(kappas, fix(kappas))
+    # plt.plot(kappas, (kappas))
+    # plt.plot([kappa], [kappa], marker="o", color="k")
+    # plt.show()
+    
+    assert kappa >= 0
+
     return kappa
 
 def get_gamma(kappa, spec, P):
@@ -221,10 +241,11 @@ def get_gamma(kappa, spec, P):
     Canatar21, eq. (4)
     """
     assert np.ndim(spec) == 1
-    assert np.isscalar(kappa)
     assert np.isscalar(P)
 
-    return np.sum(P*spec**2/(kappa + P*spec)**2)
+    gamma = np.sum(P*spec**2/(kappa + P*spec)**2)
+    assert 0 <= gamma < 1
+    return gamma
 
 def get_var(l, kappa, gamma, P, sigma, spec, w_bar=None):
     """
@@ -235,6 +256,11 @@ def get_var(l, kappa, gamma, P, sigma, spec, w_bar=None):
 
     # assume a typical target function sampled from the GP
     if w_bar is None:
-        w_bar = np.array([np.random.normal(0, spec[l]**0.5) for l, _ in enumerate(spec)])
+        w_bar = np.array([np.random.normal(0, scale=spec[l]**0.5) for l, _ in enumerate(spec)])
 
-    return 1/(1-gamma)*(sigma**2 + kappa**2*np.sum(spec*w_bar**2/(P*spec + kappa)**2)) + P*spec[l]**2/(P*spec[l] + kappa)**2
+    var = 1/(1-gamma)*(sigma**2 + kappa**2*np.sum(spec*w_bar**2/(P*spec + kappa)**2)) 
+    var *= P*spec[l]**2 / (P*spec[l] + kappa)**2
+    var /= np.sqrt(spec[l]**2)
+    return var
+
+get_var = np.vectorize(get_var, excluded=["kappa", "gamma", "P", "sigma", "spec", "w_bar"])
