@@ -10,6 +10,7 @@ from scipy.optimize import curve_fit
 from scipy.special import gamma, factorial, gegenbauer
 from scipy.special import gamma, binom
 import logging
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -171,20 +172,18 @@ def z_dl(d, l):
     return z_canatar
 
 
-def get_lambda_int(l, d, shape_fn=None, p=None, d_opts=None, repeat_degenerate=False, error_level="warn"):
+def get_lambda_int(l, d, shape_fn=None, p=None, repeat_degenerate=False, error_level="warn"):
     """
     see Dutordoir2020, Funk-Hecke
     """
-
 
     if p is None:
         logger.info("No measure p given, using uniform measure on the sphere.")
         p = get_uniform_measure(d)
 
-
-    assert (d_opts is not None) or (shape_fn is not None and p is not None), "Either operate in data or kernel mode. "
     assert not d < 3, "Spherical harmonics undefined for d<3"
 
+    @np.vectorize
     def get_lambda_int_(l, d):
         """
         Note: This follows the prescription at 
@@ -213,7 +212,7 @@ def get_lambda_int(l, d, shape_fn=None, p=None, d_opts=None, repeat_degenerate=F
 
         return lmbd_l, integrand
 
-    get_lambda_int_ = np.vectorize(get_lambda_int_, excluded=["d"])
+
     lmbd_l, f = get_lambda_int_(l, d)
 
     PLOT = False
@@ -226,8 +225,19 @@ def get_lambda_int(l, d, shape_fn=None, p=None, d_opts=None, repeat_degenerate=F
             ax.set_title(f"l={l[iax]}")
             ax.legend()
         fig.savefig("test_lambda_int.png", dpi=200)
-    
-    return lmbd_l
+            
+    if repeat_degenerate:
+        lmbd_l_ = []
+        ls_= []
+        for il, l_ in enumerate(np.atleast_1d(l)):
+            ls_ += [l_] * z_dl(d, l_)
+            lmbd_l_ += [lmbd_l[il]] * z_dl(d, l_)
+        ls_ = np.array(ls_)
+        lmbd_l = np.array(lmbd_l_)
+    else:
+        ls_ = l
+
+    return ls_, lmbd_l
 
 def funk_hecke_integrator(f):
     """
@@ -246,6 +256,7 @@ def funk_hecke_integrator(f):
 
     f_int = (f_int[1:] + f_int[:-1])/2
     overlap = np.sum(f_int*dx)
+    assert np.isfinite(overlap)
     return overlap
 
 
@@ -264,12 +275,13 @@ def kernel_hist(d_opts, nbins=100, ax=None):
     return XX_centers, YY_hist
 
 
-def bin_XX_YY_with_std(XX, YY, bins=None, separate_1=False, exclude_1=False, interpolate_nan=False, return_empty=False):
+def bin_XX_YY_with_std(XX, YY, bins=None, separate_1=False, exclude_1=False, interpolate_nan=False, return_empty=False, error_type="standard_deviation"):
     """
     Turns flattened input and output tensors into bins and values at bins, thus effectively discretizing the data.
     """
     # assert (XX <= 1).all() and (XX >= -1).all()
 
+    assert error_type in ["standard_deviation", "standard_error"]
     one_thsd = 1e-6
     if exclude_1:
         YY = YY[np.abs(XX - 1) > one_thsd]
@@ -286,12 +298,15 @@ def bin_XX_YY_with_std(XX, YY, bins=None, separate_1=False, exclude_1=False, int
     XX_centers = (bin_edg[1:] + bin_edg[:-1]) / 2
     YY_hist_mean = np.empty_like(XX_hist, dtype=float)
     YY_hist_std = np.empty_like(XX_hist, dtype=float)
+    YY_counts = np.zeros_like(XX_hist, dtype=int)
 
     for i in range(len(bin_edg) - 1):
         hits = YY[(XX >= bin_edg[i]) & (XX <= bin_edg[i + 1])]
         if len(hits) > 0:
+            YY_counts[i] = len(hits)
             YY_hist_mean[i] = hits.mean()
-            YY_hist_std[i] = hits.std()
+            YY_hist_std[i] = hits.std() / (len(hits) ** 0.5 if error_type == "standard_error" else 1)
+            
         else:
             YY_hist_mean[i] = np.nan
             YY_hist_std[i] = np.nan
@@ -301,6 +316,7 @@ def bin_XX_YY_with_std(XX, YY, bins=None, separate_1=False, exclude_1=False, int
         XX_centers = XX_centers[idx_nonempty]
         YY_hist_mean = YY_hist_mean[idx_nonempty]
         YY_hist_std = YY_hist_std[idx_nonempty]
+        YY_counts = YY_counts[idx_nonempty]
 
     # ax.bar(bin_edg[:-1] - 1, YY_hist, width=w, align='edge', color="gray", alpha=0.3)
     YY_hist_mean = (YY_hist_mean)
@@ -316,7 +332,7 @@ def bin_XX_YY_with_std(XX, YY, bins=None, separate_1=False, exclude_1=False, int
     # ax.bar(-np.flip(bin_edg[1:]) + 1, height=2 * YY_hist_std, bottom=YY_hist - YY_hist_std, width=np.flip(w),
     #        align='edge', color="tab:blue", alpha=0.1, zorder=-1)
 
-    return XX_centers, YY_hist_mean, YY_hist_std
+    return XX_centers, YY_hist_mean, YY_hist_std, YY_counts
 
 
 def test_funk_hecke_integrator():
@@ -326,3 +342,57 @@ def test_funk_hecke_integrator():
     overlap2 = quad(f, -1, 1, limit=1000)
     print(overlap1)
     print(overlap2)
+
+
+def fit_spectrum_decay(ranks, eigenvalues, where_fit=slice(None, None), N_rescale=1,):
+    # norm 
+    eigenvalues = eigenvalues / np.max(eigenvalues)
+    
+    idx = ranks
+
+    # use the Kaiser criterion to determine the knee point of the spectrum
+    if where_fit == "kaiser":
+        logger.info("Using Kaiser criterion to determine knee point of spectrum.")
+        where_fit = np.where(eigenvalues > 1 / N_rescale)[0]
+        # ax.set_ylim(0.1 * 1 / N_rescale, None)
+    elif where_fit == "knee":
+        from kneed import KneeLocator
+        log10_idx = np.log10(idx)
+        # interpolate the eigenvalues on a log10 scale
+        xx = np.linspace(log10_idx.min(), log10_idx.max(), 1000)
+        yy = np.interp(xx, log10_idx, np.log10(eigenvalues))
+        kl = KneeLocator(xx, yy, curve='concave', direction='decreasing', online=True)
+        # plt.close("all")
+        # plt.plot(xx, yy)
+        # plt.plot(kl.x_normalized, kl.y_normalized)
+        # plt.plot(kl.x_difference, kl.y_difference)
+        # plt.show()
+        knee = kl.knee
+        knee_index = np.argmin(np.abs(log10_idx - knee))
+        # ax.axvline(idx[knee_index], c="k", ls="--", lw=1) 
+        where_fit = idx < idx[knee_index]
+
+        # ax.set_ylim(eigenvalues[knee_index] / 100, None)
+    
+
+    x = np.log(ranks[where_fit])
+    y = np.log(eigenvalues[where_fit])
+
+    slope, intercept = np.polyfit(x, y, 1)
+    f_fit = lambda ranks: np.exp(intercept) * np.power(ranks, slope)
+
+    alpha = -slope
+    
+    return alpha, f_fit, where_fit
+
+def l_to_ml(ls, N):
+    """
+    Move the indices l so that they reflect the multiplicities
+    0    111   22222   
+    0     2      6
+    """
+    ml = 0
+    mls = [0]
+    for l in ls[1:]:
+        mls += [mls[-1] + (z_dl(N, l-1) - 1)//2 + (z_dl(N, l) + 1)//2]
+    return np.array(mls)
