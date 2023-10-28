@@ -12,11 +12,18 @@ from scipy.special import gamma, binom
 import logging
 import numpy as np
 
+from bayesianchaos.CONST import DISABLE_CACHE, JOBLIB_VERB, PRJ_ROOT, SRC_ROOT
+from joblib import Memory
+
+memory = Memory(
+    location=None if DISABLE_CACHE else SRC_ROOT / "cache", verbose=0, 
+)
+
+
 logger = logging.getLogger(__name__)
 
 # set verbosity to warning
-logger.setLevel(logging.WARNING)
-
+logger.setLevel(logging.INFO)
 
 def shell_measure(d_emb):
     assert d_emb >= 3
@@ -137,19 +144,118 @@ def get_bn_disc(x,y,deg, x0=0, omit_0=True):
 
 
 def reconstruct_from_spec(lmbds, d):
+    """
+    Generates a callable from a given spectrum. 
+    """
     w_d = np.pi**-0.5 * frac_gamma(x=d/2, da=0, db=-1/2)
     alpha = (d-2)/2
     ggb = lambda l: gegenbauer(alpha=alpha, n=l)
     C_alpha_l = ggb(1)
     mu = lambda xx: (1-xx**2)**((d-3)/2)
 
-    def f(xx):
+    def k(xx):
         # because the ggb polynomials are orthonormal wrt (1-t^2)^(alpha-1/2), we can omit this factor in the reconstruction
         return np.sum([lmbds[l]*ggb(l)(xx) for l in range(len(lmbds))], axis=0) / len(lmbds)
     
-    return f
+    return k
+
+def get_k(a):
+    return lambda xx: np.sign(xx)*np.abs((np.arcsin(xx)/(np.pi/2)))**a
+
+def get_A_spectral_projection(X, lmbd_out=None, alpha_proj=None):    
+    # do a PCA via SKLearn
+    from sklearn.decomposition import PCA
+    pca = PCA(n_components=min(X.shape[-1], 512))
+
+    # n_samples, n_features
+    pca.fit(X)
+
+    # n_components, n_features
+    U = pca.components_
+    lmbds_is = pca.explained_variance_
+
+    if alpha_proj is not None:
+        lmbds_out = (np.arange(1, len(lmbds_is)+1)**-alpha_proj)**0.5
+    
+    A = np.einsum("ni,n,nj->ij", U, lmbds_out[:len(lmbds_is)], U)
+
+    return A
 
 
+
+def kernel_from_alpha(alpha, d, p=None, X=None, opt_p=None, fit_args=dict()):
+    assert p is not None or X is not None, "Either p or X must be given."
+    assert not (p is not None and X is not None), "Either p or X must be given, not both."
+
+    p = get_uniform_measure(d) if p is None else p
+
+    logger.info(f"Searching kernel with fit params {fit_args}.")
+
+    def get_alpha(k, p):
+        ls = np.arange(0, 10) + 1
+        _, lmbds = get_lambda_int(ls, d, shape_fn=k, p=p, repeat_degenerate=True, error_level="warn")
+        lmbds = lmbds / lmbds[0]
+
+        alpha_decay_is = fit_spectrum_decay(np.arange(len(lmbds)) + 1, lmbds, N_rescale=1, **fit_args)[0]
+        return alpha_decay_is
+
+
+    # make an optimization loop that takes a kernel and returns the alpha that minimizes the error
+    def trafo(x, g):
+        return np.sign(x)*np.abs(x)**g
+
+    def get_p_fit(x):
+        if not opt_p:
+            p_fit = p
+        elif opt_p == 'proj':
+            A = get_A_spectral_projection(X, lmbd_out=None, alpha_proj=x[1])
+            X_out = np.einsum("ij,...j->...i", A, X)
+            bins = np.linspace(-1,1,100)
+            hist, _ = np.histogram((X_out@X_out.T).flatten(), bins=bins, density=True)
+            p_fit = lambda xx: np.interp(xx, bins[:-1], hist)
+        elif opt_p == 'trafo':
+            p_fit_ = lambda xx: p(trafo((xx), x[1]))
+            # normalize
+            p_fit = lambda xx: p_fit_(xx) / integrate.quad(p_fit_, -1, 1)[0]
+        else:
+            raise ValueError(f"opt_p={opt_p} not recognized.")
+        
+        return p_fit
+
+    def zero(x):
+        a = x[0]
+        p_fit = get_p_fit(x)
+        k = get_k(a)
+        alpha_decay_is = get_alpha(k, p_fit)
+
+        return (alpha_decay_is - alpha)**2
+
+
+    from scipy.optimize import minimize
+    callback = lambda x: logger.info(f"Current params: {x}")
+    options = {"disp": True, "maxiter": 100}
+    from types import SimpleNamespace
+    misc = SimpleNamespace()
+
+    if not opt_p:
+        res = minimize(zero, x0=(1), bounds=[(1, 10)], tol=1e-1, method="L-BFGS-B", callback=callback, options=options)
+    elif opt_p == 'proj':
+        res = minimize(zero, x0=[1, 1], bounds=[(1, 10), (.1, 2)], tol=1e-3, method="L-BFGS-B", callback=callback, options=options)
+        misc.alpha_proj = res.x[1]
+        misc.A = get_A_spectral_projection(X, lmbd_out=None, alpha_proj=misc.alpha_proj)
+    elif opt_p == 'trafo':
+        res = minimize(zero, x0=(3, 2), bounds=[(1, 10), (.1, 10)], tol=1e-3, method="L-BFGS-B", callback=callback, options=options)
+        misc.g = res.x[1]
+
+    misc.param = res.x[0]
+    k = get_k(misc.param)
+    p_fit = get_p_fit(res.x)
+    misc.p_fit = p_fit
+
+    alpha_decay_fit = get_alpha(k, p_fit)
+    logger.info(f"Found powerlaw a={misc.param:.2f} at alpha={alpha_decay_fit:.2f}, {misc}")
+
+    return k, misc
 
 # get the dimension of the Hilbert space in dimension d and at mode l
 def z_dl(d, l): 
@@ -178,7 +284,7 @@ def get_lambda_int(l, d, shape_fn=None, p=None, repeat_degenerate=False, error_l
     """
 
     if p is None:
-        logger.info("No measure p given, using uniform measure on the sphere.")
+        logger.warning("No measure p given, using uniform measure on the sphere.")
         p = get_uniform_measure(d)
 
     assert not d < 3, "Spherical harmonics undefined for d<3"
@@ -197,6 +303,7 @@ def get_lambda_int(l, d, shape_fn=None, p=None, repeat_degenerate=False, error_l
         if shape_fn:
             integrand = lambda cth: C_alpha_l**-1 * shape_fn(cth) * ggb(cth) * p(cth)
             # custom integration routine
+            assert np.allclose(funk_hecke_integrator(p), 1., atol=1e-2)
             integral = funk_hecke_integrator(integrand)
         else:
             XX_centers, YY_hist = kernel_hist(d_opts, nbins=100)
@@ -244,9 +351,15 @@ def funk_hecke_integrator(f):
     Alternatively, a quadrature rule could be used, as detailed in 
     Canatar21, Supplementary Material, eq. (121f)
     """
-    unit_int = np.geomspace(1e-4, 1, int(1e4-2))
-    xx_int = np.concatenate([[-1], -1+unit_int, 1-unit_int[::-1], [1]])
+    xx_uni = np.linspace(-1, 1, int(1e4 + 1))
+    xx_int = np.sin(np.pi/2 * xx_uni)
+    assert xx_int.min() == -1
+    assert xx_int.max() == 1
+    assert 0. in xx_int
+
+
     dx = np.diff(xx_int)
+    assert (dx > 0).all()
     f_int = f(xx_int)
     # handle divergences at boundaries
     if not np.isfinite(f_int[-1]):
@@ -343,12 +456,13 @@ def test_funk_hecke_integrator():
     print(overlap1)
     print(overlap2)
 
+# @memory.cache
+def fit_spectrum_decay(ranks, eigenvalues, where_fit=slice(None, None), N_rescale=1,**kwargs):    
 
-def fit_spectrum_decay(ranks, eigenvalues, where_fit=slice(None, None), N_rescale=1,):
-    # norm 
-    eigenvalues = eigenvalues / np.max(eigenvalues)
-    
-    idx = ranks
+    if ranks.min() == 0:
+        ranks += 1
+
+    where_nonepsilon = eigenvalues > 1e-8
 
     # use the Kaiser criterion to determine the knee point of the spectrum
     if where_fit == "kaiser":
@@ -357,33 +471,41 @@ def fit_spectrum_decay(ranks, eigenvalues, where_fit=slice(None, None), N_rescal
         # ax.set_ylim(0.1 * 1 / N_rescale, None)
     elif where_fit == "knee":
         from kneed import KneeLocator
-        log10_idx = np.log10(idx)
+        log10_ranks = np.log10(ranks)
         # interpolate the eigenvalues on a log10 scale
-        xx = np.linspace(log10_idx.min(), log10_idx.max(), 1000)
-        yy = np.interp(xx, log10_idx, np.log10(eigenvalues))
+        xx = np.linspace(log10_ranks.min(), log10_ranks.max(), 1000)
+        yy = np.interp(xx, log10_ranks[where_nonepsilon], np.log10(eigenvalues[where_nonepsilon]))
         kl = KneeLocator(xx, yy, curve='concave', direction='decreasing', online=True)
         # plt.close("all")
-        # plt.plot(xx, yy)
         # plt.plot(kl.x_normalized, kl.y_normalized)
         # plt.plot(kl.x_difference, kl.y_difference)
+        # plt.axvline(kl.knee, c="k", ls="--", lw=1)
         # plt.show()
         knee = kl.knee
-        knee_index = np.argmin(np.abs(log10_idx - knee))
-        # ax.axvline(idx[knee_index], c="k", ls="--", lw=1) 
-        where_fit = idx < idx[knee_index]
+        knee_index = np.argmin(np.abs(log10_ranks - knee))
+        # ax.axvline(ranks[knee_index], c="k", ls="--", lw=1) 
+        where_fit = ranks < ranks[knee_index]
 
         # ax.set_ylim(eigenvalues[knee_index] / 100, None)
-    
 
-    x = np.log(ranks[where_fit])
-    y = np.log(eigenvalues[where_fit])
+    elif type(where_fit) == slice:
+        where_fit_ = np.full_like(ranks, False, dtype=bool)
+        where_fit_[where_fit] = True
+        where_fit = where_fit_
+    else:
+        raise ValueError("where_fit must be either 'kaiser', 'knee', or a slice object.")
+    
+    where_fit_tot = where_fit & where_nonepsilon
+
+    x = np.log(ranks[where_fit_tot])
+    y = np.log(eigenvalues[where_fit_tot])
 
     slope, intercept = np.polyfit(x, y, 1)
     f_fit = lambda ranks: np.exp(intercept) * np.power(ranks, slope)
 
     alpha = -slope
     
-    return alpha, f_fit, where_fit
+    return alpha, f_fit, where_fit_tot
 
 def l_to_ml(ls, N):
     """
