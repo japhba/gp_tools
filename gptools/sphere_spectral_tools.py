@@ -351,7 +351,7 @@ def funk_hecke_integrator(f):
     Alternatively, a quadrature rule could be used, as detailed in 
     Canatar21, Supplementary Material, eq. (121f)
     """
-    xx_uni = np.linspace(-1, 1, int(1e4 + 1))
+    xx_uni = np.linspace(-1, 1, int(1e3 + 1))
     xx_int = np.sin(np.pi/2 * xx_uni)
     assert xx_int.min() == -1
     assert xx_int.max() == 1
