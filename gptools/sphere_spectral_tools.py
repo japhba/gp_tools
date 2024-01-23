@@ -278,7 +278,7 @@ def z_dl(d, l):
     return z_canatar
 
 
-def get_lambda_int(l, d, shape_fn=None, p=None, repeat_degenerate=False, error_level="warn"):
+def get_lambda_int(l, d, shape_fn, p=None, repeat_degenerate=False, error_level="warn"):
     """
     see Dutordoir2020, Funk-Hecke
     """
@@ -300,21 +300,18 @@ def get_lambda_int(l, d, shape_fn=None, p=None, repeat_degenerate=False, error_l
         alpha = (d-2)/2
         ggb = gegenbauer(alpha=alpha, n=l)
         C_alpha_l = ggb(1)
-        if shape_fn:
-            integrand = lambda cth: C_alpha_l**-1 * shape_fn(cth) * ggb(cth) * p(cth)
-            # custom integration routine
-            assert np.allclose(funk_hecke_integrator(p), 1., atol=1e-2)
-            integral = funk_hecke_integrator(integrand)
-        else:
-            XX_centers, YY_hist = kernel_hist(d_opts, nbins=100)
-            integral = np.sum(ggb(XX_centers) * YY_hist) / len(XX_centers)
+        integrand = lambda cth: C_alpha_l**-1 * shape_fn(cth) * ggb(cth) * p(cth)
+        # custom integration routine
+        assert np.allclose(funk_hecke_integrator(p), 1., atol=1e-2)
+        integral = funk_hecke_integrator(integrand)
+
 
         assert not np.isnan(integral).any()
         lmbd_l = integral
 
         if lmbd_l < 0:
             if error_level:
-                assert lmbd_l > -1e-2
+                assert lmbd_l > -1e-2, (f"lmbd_l={lmbd_l} is not positive definite.")
             lmbd_l = 0.
 
         return lmbd_l, integrand
@@ -344,6 +341,9 @@ def get_lambda_int(l, d, shape_fn=None, p=None, repeat_degenerate=False, error_l
     else:
         ls_ = l
 
+    
+    assert (lmbd_l > 0).any()
+
     return ls_, lmbd_l
 
 def funk_hecke_integrator(f):
@@ -352,7 +352,9 @@ def funk_hecke_integrator(f):
     Canatar21, Supplementary Material, eq. (121f)
     """
     xx_uni = np.linspace(-1, 1, int(1e3 + 1))
-    xx_int = np.sin(np.pi/2 * xx_uni)
+    a = 1.
+    if a != 1: raise NotImplementedError
+    xx_int = np.sign(xx_uni)*np.abs(np.sin(np.pi/2 * xx_uni))**a
     assert xx_int.min() == -1
     assert xx_int.max() == 1
     assert 0. in xx_int
@@ -361,6 +363,7 @@ def funk_hecke_integrator(f):
     dx = np.diff(xx_int)
     assert (dx > 0).all()
     f_int = f(xx_int)
+
     # handle divergences at boundaries
     if not np.isfinite(f_int[-1]):
         f_int[0] = f_int[1]
@@ -457,7 +460,10 @@ def test_funk_hecke_integrator():
     print(overlap2)
 
 # @memory.cache
-def fit_spectrum_decay(ranks, eigenvalues, where_fit=slice(None, None), N_rescale=1,**kwargs):    
+def fit_spectrum_decay(ranks, eigenvalues, where_fit=slice(None, None), N_rescale=1,**kwargs): 
+
+    ranks = np.array(ranks)
+    eigenvalues = np.array(eigenvalues)   
 
     if ranks.min() == 0:
         ranks += 1

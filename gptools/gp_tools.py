@@ -13,7 +13,10 @@ filename = os.path.basename(__file__).replace('.py', '')
 import logging
 logger = logging.getLogger(__name__)
 
-def get_GP_samples(X_train=None, N_samples=1, K=None, k_dx=None, seed=1235, reg=0., dX_mode ="norm", pdify=False, check_valid="warn"):
+def get_GP_samples(X_train=None, N_samples=1, K=None, k_dx=None, seed=1235, reg=0., dX_mode ="norm", pdify=False, check_valid="warn", method="svd"):
+    """
+    Use method "cholesky" for speed.
+    """
     if K is None:
         if X_train.ndim == 1:
             X_train_vec = X_train[:, None]
@@ -38,12 +41,15 @@ def get_GP_samples(X_train=None, N_samples=1, K=None, k_dx=None, seed=1235, reg=
 
     if pdify:
         K = nearestPD(K)
-    samples = get_GP_samples_(K, N_samples, K.shape[0], seed, reg, check_valid=check_valid)
+    
+    K = np.array(K)
+    assert np.isfinite(K).all()
+    samples = get_GP_samples_(K, N_samples, K.shape[0], seed, reg, check_valid=check_valid, method=method)
     return np.squeeze(samples)
 
 
 @memory.cache
-def get_GP_samples_(K, N_samples, N_supp, seed, reg, check_valid="warn"):
+def get_GP_samples_(K, N_samples, N_supp, seed, reg, check_valid="warn", method="svd"):
     # sample manually to get continuously transformed samples off the kernel
     # https://juanitorduz.github.io/multivariate_normal/
     # get uncorrelated vectors
@@ -55,7 +61,12 @@ def get_GP_samples_(K, N_samples, N_supp, seed, reg, check_valid="warn"):
 
     # passing the argument "cholesky" reproduces this behavior out-of-the-box
     rng = np.random.default_rng(seed)
-    samples = rng.multivariate_normal([0] * N_supp, K+ np.eye(K.shape[0])*reg, size=N_samples, check_valid=check_valid)
+    samples = rng.multivariate_normal([0] * N_supp, K + np.eye(K.shape[0])*reg, size=N_samples, check_valid=check_valid, method=method)
+    
+    # from jax import random
+    # key = random.PRNGKey(seed)
+    # samples = random.multivariate_normal(key, np.zeros(N_supp), K+ np.eye(K.shape[0])*reg, shape=(N_samples,), method=method)
+    
     return samples
 
 
@@ -89,8 +100,11 @@ def plot_posterior(ax, x_all, y_match, y_fail, X_obs, Y_obs, x_tst, cmap, color_
 
 
 # @memory.cache
+import jax.numpy as jnp
 def get_Y_pr(K_xX, K_XX, y_tr, nearest_PD=False, inv_mode="cholesky", reg=0., verbose=0):
-    K_XX += reg*np.eye(K_XX.shape[0])
+    K_XX += reg*jnp.eye(K_XX.shape[0])
+
+    logger.info(f"Getting prediction with a {K_XX.shape[0]}x{K_XX.shape[1]} kernel matrix. ")
 
     if nearest_PD:
         K_XX = nearestPD(K_XX)
@@ -98,23 +112,23 @@ def get_Y_pr(K_xX, K_XX, y_tr, nearest_PD=False, inv_mode="cholesky", reg=0., ve
 
     if inv_mode == "cholesky":
         try:
-            L = np.linalg.cholesky(K_XX)
+            L = jnp.linalg.cholesky(K_XX)
         except LinAlgError:
             logger.warning("Matrix not positive definite for cholesky, calling PD-ifier... This can result in poor condition number!")
             K_XX = nearestPD(K_XX)
-            L = np.linalg.cholesky(K_XX)
+            L = jnp.linalg.cholesky(K_XX)
 
-        y_pr = K_xX @ np.linalg.inv(L).T @ np.linalg.inv(L) @ y_tr
+        y_pr = K_xX @ jnp.linalg.inv(L).T @ jnp.linalg.inv(L) @ y_tr
     elif inv_mode == "pinv":
-        y_pr = K_xX @ np.linalg.pinv(K_XX)@y_tr
+        y_pr = K_xX @ jnp.linalg.pinv(K_XX)@y_tr
     elif inv_mode == "inv":
-        y_pr = K_xX @ np.linalg.inv(K_XX)@y_tr
+        y_pr = K_xX @ jnp.linalg.inv(K_XX)@y_tr
     else:
         raise ValueError
     
     if verbose > 0:
-        eigvals = np.linalg.eigvalsh(K_XX)
-        print(f"Condition number is {(np.max(eigvals)/np.min(eigvals)):.2f}")
+        eigvals = jnp.linalg.eigvalsh(K_XX)
+        print(f"Condition number is {(jnp.max(eigvals)/jnp.min(eigvals)):.2f}")
     return y_pr
 
 def vectors_from_theta(theta, d, norm=1., model='rate', full_circle=False):
