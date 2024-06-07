@@ -258,7 +258,7 @@ def kernel_from_alpha(alpha, d, p=None, X=None, opt_p=None, fit_args=dict()):
     return k, misc
 
 # get the dimension of the Hilbert space in dimension d and at mode l
-def z_dl(d, l): 
+def z_dl(d, l, apx=False): 
     """
     Multiplicity of the spherical harmonic of degree l in dimension d
     """
@@ -272,20 +272,35 @@ def z_dl(d, l):
     assert z_canatar == z_wiki
     # assert z_canatar == z_wiki
 
-    if d >= 10:
+    if d > 30:
         logger.warning(f"Large degeneracy at dimension {d}.") 
 
-    return z_canatar
+    return z_canatar if not apx else z_canatar_apx
+
+@np.vectorize
+def num_l_to_num_ml(num_l, d):
+    return np.sum([z_dl(d, l) for l in range(num_l)])
+
+def num_ml_to_num_l(num_ml, d):
+    num_ml_cand = np.arange(100)
+    return np.where(num_ml < num_l_to_num_ml(num_ml_cand, d))[0][0]
+    
+# print(num_l_to_num_ml(5, 3))
+# print(num_ml_to_num_l(2048, 3))
 
 
-def get_lambda_int(l, d, shape_fn, p=None, repeat_degenerate=False, error_level="warn"):
+def get_lambda_int(l, d, shape_fn, p=None, xx_p=None, repeat_degenerate=False, error_level="warn"):
     """
     see Dutordoir2020, Funk-Hecke
     """
-
+    p_uni = get_uniform_measure(d)
     if p is None:
         logger.warning("No measure p given, using uniform measure on the sphere.")
-        p = get_uniform_measure(d)
+        p = p_uni
+    
+    if not hasattr(p, "__call__"):
+        p_vals = p
+        p = lambda xx: np.interp(xx, xx_p, p_vals)
 
     assert not d < 3, "Spherical harmonics undefined for d<3"
 
@@ -300,7 +315,7 @@ def get_lambda_int(l, d, shape_fn, p=None, repeat_degenerate=False, error_level=
         alpha = (d-2)/2
         ggb = gegenbauer(alpha=alpha, n=l)
         C_alpha_l = ggb(1)
-        integrand = lambda cth: C_alpha_l**-1 * shape_fn(cth) * ggb(cth) * p(cth)
+        integrand = lambda xx: C_alpha_l**-1 * shape_fn(xx) * (ggb(xx) * p_uni(xx)) * (p(xx) / p_uni(xx))
         # custom integration routine
         assert np.allclose(funk_hecke_integrator(p), 1., atol=1e-2)
         integral = funk_hecke_integrator(integrand)
@@ -342,8 +357,6 @@ def get_lambda_int(l, d, shape_fn, p=None, repeat_degenerate=False, error_level=
         ls_ = l
 
     
-    assert (lmbd_l > 0).any()
-
     return ls_, lmbd_l
 
 def funk_hecke_integrator(f):
@@ -351,18 +364,18 @@ def funk_hecke_integrator(f):
     Alternatively, a quadrature rule could be used, as detailed in 
     Canatar21, Supplementary Material, eq. (121f)
     """
-    xx_uni = np.linspace(-1, 1, int(1e3 + 1))
+    eps = 1e-4  # to avoid critical points in the 1 / ( 1 - xx**2 ) integrand
+    xx_uni = np.linspace(-1 + eps, 1 - eps, int(1e3 + 1))
     a = 1.
     if a != 1: raise NotImplementedError
     xx_int = np.sign(xx_uni)*np.abs(np.sin(np.pi/2 * xx_uni))**a
-    assert xx_int.min() == -1
-    assert xx_int.max() == 1
     assert 0. in xx_int
 
 
     dx = np.diff(xx_int)
     assert (dx > 0).all()
     f_int = f(xx_int)
+    f_int = np.array(f_int)
 
     # handle divergences at boundaries
     if not np.isfinite(f_int[-1]):
@@ -464,6 +477,10 @@ def fit_spectrum_decay(ranks, eigenvalues, where_fit=slice(None, None), N_rescal
 
     ranks = np.array(ranks)
     eigenvalues = np.array(eigenvalues)   
+
+    if not np.isfinite(eigenvalues).all():
+        logger.warning("Eigenvalues contain non-finite values.")
+        return np.nan, lambda ranks: np.full_like(ranks, np.nan), where_fit
 
     if ranks.min() == 0:
         ranks += 1
