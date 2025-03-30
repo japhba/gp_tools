@@ -36,6 +36,26 @@ def get_uniform_measure(d):
     Z_inv = np.pi**-0.5 * frac_gamma(x=d/2, da=0, db=-1/2)
     return lambda t: Z_inv*(1-t**2)**((d-3)/2)
 
+def alpha_fn_from_lambda(mls, lmbds, window=None):
+    """
+    Computes a sliding-window estimate of the spectral decay of the kernel.
+    """
+    log_lmbds = np.log(lmbds)
+    log_mls = np.log(mls)
+
+    log_mls_dense = np.linspace(log_mls.min(), log_mls.max(), 1000)
+    log_lmbds_interp = np.interp(log_mls_dense, log_mls, log_lmbds)
+
+    # smooth the spectrum
+    smoothing_kernel = np.ones(window) / window
+    log_lmbds_interp_smooth = np.convolve(log_lmbds_interp, smoothing_kernel, mode="same")
+
+
+    alpha_smooth = np.gradient(log_lmbds_interp_smooth, log_mls_dense)
+        
+    return lambda mls: np.exp(np.interp(np.log(mls), log_mls_dense, alpha_smooth))
+
+
 
 def get_Y_from_spectrum(var_lmbds, d, seed):
     from scipy.special import sph_harm
@@ -150,7 +170,7 @@ def reconstruct_from_spec(lmbds, d):
     w_d = np.pi**-0.5 * frac_gamma(x=d/2, da=0, db=-1/2)
     alpha = (d-2)/2
     ggb = lambda l: gegenbauer(alpha=alpha, n=l)
-    C_alpha_l = ggb(1)
+    C_alpha_l = ggb(1)  # from Wiki: https://en.wikipedia.org/wiki/Gegenbauer_polynomials this value is Gamma(2*alpha+l) / (l! * (Gamma(2*alpha)))
     mu = lambda xx: (1-xx**2)**((d-3)/2)
 
     def k(xx):
@@ -258,6 +278,7 @@ def kernel_from_alpha(alpha, d, p=None, X=None, opt_p=None, fit_args=dict()):
     return k, misc
 
 # get the dimension of the Hilbert space in dimension d and at mode l
+@np.vectorize
 def z_dl(d, l, apx=False): 
     """
     Multiplicity of the spherical harmonic of degree l in dimension d
@@ -272,9 +293,6 @@ def z_dl(d, l, apx=False):
     assert z_canatar == z_wiki
     # assert z_canatar == z_wiki
 
-    if d > 30:
-        logger.warning(f"Large degeneracy at dimension {d}.") 
-
     return z_canatar if not apx else z_canatar_apx
 
 @np.vectorize
@@ -284,6 +302,28 @@ def num_l_to_num_ml(num_l, d):
 def num_ml_to_num_l(num_ml, d):
     num_ml_cand = np.arange(100)
     return np.where(num_ml < num_l_to_num_ml(num_ml_cand, d))[0][0]
+
+def alpha_l_to_alpha_ml(ls, alpha_l, d):
+    """
+    power laws transform like the log:
+    a_l / a_ml = log(m) / log(l)
+
+    ls: ls where the power law holds
+    """
+
+    mls = num_l_to_num_ml(ls, d)
+    rat = (np.log(mls) / np.log(ls))**-1
+    rat = rat[mls > 1]
+    logger.info(f"Ratios: {rat.mean(), rat.std()}")
+    return alpha_l * rat.mean()
+
+def alpha_ml_to_alpha_l(mls, alpha_ml, d):
+    ls = num_ml_to_num_l(mls, d)
+    rat = np.log(mls) / np.log(ls)
+    rat = rat[mls > 1]
+    logger.info(f"Ratios: {rat.mean(), rat.std()}")
+    return alpha_ml * rat.mean()
+
     
 # print(num_l_to_num_ml(5, 3))
 # print(num_ml_to_num_l(2048, 3))
@@ -315,7 +355,7 @@ def get_lambda_int(l, d, shape_fn, p=None, xx_p=None, repeat_degenerate=False, e
         alpha = (d-2)/2
         ggb = gegenbauer(alpha=alpha, n=l)
         C_alpha_l = ggb(1)
-        integrand = lambda xx: C_alpha_l**-1 * shape_fn(xx) * (ggb(xx) * p_uni(xx)) * (p(xx) / p_uni(xx))
+        integrand = lambda xx: 1/C_alpha_l * shape_fn(xx) * (ggb(xx) * p_uni(xx)) * (p(xx) / p_uni(xx))
         # custom integration routine
         assert np.allclose(funk_hecke_integrator(p), 1., atol=1e-2)
         integral = funk_hecke_integrator(integrand)
@@ -349,8 +389,8 @@ def get_lambda_int(l, d, shape_fn, p=None, xx_p=None, repeat_degenerate=False, e
         lmbd_l_ = []
         ls_= []
         for il, l_ in enumerate(np.atleast_1d(l)):
-            ls_ += [l_] * z_dl(d, l_)
-            lmbd_l_ += [lmbd_l[il]] * z_dl(d, l_)
+            ls_ += [l_] * int(z_dl(d, l_))
+            lmbd_l_ += [lmbd_l[il]] * int(z_dl(d, l_))
         ls_ = np.array(ls_)
         lmbd_l = np.array(lmbd_l_)
     else:
@@ -473,28 +513,38 @@ def test_funk_hecke_integrator():
     print(overlap2)
 
 # @memory.cache
-def fit_spectrum_decay(ranks, eigenvalues, where_fit=slice(None, None), N_rescale=1,**kwargs): 
+def fit_spectrum_decay(eigenvalues, mls=None, where_fit=None, N_rescale=1,**kwargs): 
 
-    ranks = np.array(ranks)
-    eigenvalues = np.array(eigenvalues)   
+    if mls is None:
+        mls = np.arange(len(eigenvalues)) + 1
+        
+    eigenvalues = np.array(eigenvalues)
+    
+    assert mls.shape == eigenvalues.shape, "mls and eigenvalues must have the same shape."
+    if where_fit is None:
+        where_fit = np.ones_like(mls, dtype=bool)  
 
     if not np.isfinite(eigenvalues).all():
         logger.warning("Eigenvalues contain non-finite values.")
         return np.nan, lambda ranks: np.full_like(ranks, np.nan), where_fit
 
-    if ranks.min() == 0:
-        ranks += 1
+    if mls.min() == 0:
+        mls += 1
 
     where_nonepsilon = eigenvalues > 1e-8
+    if (eigenvalues<0.).any():
+        logger.warning("Eigenvalues contain negative values.")
 
     # use the Kaiser criterion to determine the knee point of the spectrum
-    if where_fit == "kaiser":
+    if type(where_fit) == tuple:
+        where_fit = (mls >= where_fit[0] ) & (mls <= where_fit[1])
+    elif where_fit == "kaiser":
         logger.info("Using Kaiser criterion to determine knee point of spectrum.")
         where_fit = np.where(eigenvalues > 1 / N_rescale)[0]
         # ax.set_ylim(0.1 * 1 / N_rescale, None)
     elif where_fit == "knee":
         from kneed import KneeLocator
-        log10_ranks = np.log10(ranks)
+        log10_ranks = np.log10(mls)
         # interpolate the eigenvalues on a log10 scale
         xx = np.linspace(log10_ranks.min(), log10_ranks.max(), 1000)
         yy = np.interp(xx, log10_ranks[where_nonepsilon], np.log10(eigenvalues[where_nonepsilon]))
@@ -507,12 +557,12 @@ def fit_spectrum_decay(ranks, eigenvalues, where_fit=slice(None, None), N_rescal
         knee = kl.knee
         knee_index = np.argmin(np.abs(log10_ranks - knee))
         # ax.axvline(ranks[knee_index], c="k", ls="--", lw=1) 
-        where_fit = ranks < ranks[knee_index]
+        where_fit = mls < mls[knee_index]
 
         # ax.set_ylim(eigenvalues[knee_index] / 100, None)
 
     elif type(where_fit) == slice:
-        where_fit_ = np.full_like(ranks, False, dtype=bool)
+        where_fit_ = np.full_like(mls, False, dtype=bool)
         where_fit_[where_fit] = True
         where_fit = where_fit_
     else:
@@ -520,7 +570,7 @@ def fit_spectrum_decay(ranks, eigenvalues, where_fit=slice(None, None), N_rescal
     
     where_fit_tot = where_fit & where_nonepsilon
 
-    x = np.log(ranks[where_fit_tot])
+    x = np.log(mls[where_fit_tot])
     y = np.log(eigenvalues[where_fit_tot])
 
     slope, intercept = np.polyfit(x, y, 1)
